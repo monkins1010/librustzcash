@@ -1,5 +1,7 @@
 //! Generated code for handling light client protobuf structs.
 
+use incrementalmerkletree::frontier::CommitmentTree;
+use nonempty::NonEmpty;
 use std::{
     array::TryFromSliceError,
     collections::BTreeMap,
@@ -7,10 +9,8 @@ use std::{
     io,
 };
 
-use incrementalmerkletree::frontier::CommitmentTree;
-
-use nonempty::NonEmpty;
-use sapling::{self, note::ExtractedNoteCommitment, Node, Nullifier, NOTE_COMMITMENT_TREE_DEPTH};
+use sapling::{self, note::ExtractedNoteCommitment, Node};
+use zcash_note_encryption::{EphemeralKeyBytes, COMPACT_NOTE_SIZE};
 use zcash_primitives::{
     block::{BlockHash, BlockHeader},
     consensus::{self, BlockHeight, Parameters},
@@ -19,10 +19,8 @@ use zcash_primitives::{
     transaction::{components::amount::NonNegativeAmount, fees::StandardFeeRule, TxId},
 };
 
-use zcash_note_encryption::{EphemeralKeyBytes, COMPACT_NOTE_SIZE};
-
 use crate::{
-    data_api::InputSource,
+    data_api::{chain::ChainState, InputSource},
     fees::{ChangeValue, TransactionBalance},
     proposal::{Proposal, ProposalError, ShieldedInputs, Step, StepOutput, StepOutputIndex},
     zip321::{TransactionRequest, Zip321Error},
@@ -31,6 +29,9 @@ use crate::{
 
 #[cfg(feature = "transparent-inputs")]
 use zcash_primitives::transaction::components::OutPoint;
+
+#[cfg(feature = "orchard")]
+use orchard::tree::MerkleHashOrchard;
 
 #[rustfmt::skip]
 #[allow(unknown_lints)]
@@ -160,17 +161,78 @@ impl TryFrom<compact_formats::CompactSaplingOutput>
     type Error = ();
 
     fn try_from(value: compact_formats::CompactSaplingOutput) -> Result<Self, Self::Error> {
+        (&value).try_into()
+    }
+}
+
+impl TryFrom<&compact_formats::CompactSaplingOutput>
+    for sapling::note_encryption::CompactOutputDescription
+{
+    type Error = ();
+
+    fn try_from(value: &compact_formats::CompactSaplingOutput) -> Result<Self, Self::Error> {
         Ok(sapling::note_encryption::CompactOutputDescription {
             cmu: value.cmu()?,
             ephemeral_key: value.ephemeral_key()?,
-            enc_ciphertext: value.ciphertext.try_into().map_err(|_| ())?,
+            enc_ciphertext: value.ciphertext[..].try_into().map_err(|_| ())?,
         })
     }
 }
 
 impl compact_formats::CompactSaplingSpend {
-    pub fn nf(&self) -> Result<Nullifier, ()> {
-        Nullifier::from_slice(&self.nf).map_err(|_| ())
+    pub fn nf(&self) -> Result<sapling::Nullifier, ()> {
+        sapling::Nullifier::from_slice(&self.nf).map_err(|_| ())
+    }
+}
+
+#[cfg(feature = "orchard")]
+impl TryFrom<&compact_formats::CompactOrchardAction> for orchard::note_encryption::CompactAction {
+    type Error = ();
+
+    fn try_from(value: &compact_formats::CompactOrchardAction) -> Result<Self, Self::Error> {
+        Ok(orchard::note_encryption::CompactAction::from_parts(
+            value.nf()?,
+            value.cmx()?,
+            value.ephemeral_key()?,
+            value.ciphertext[..].try_into().map_err(|_| ())?,
+        ))
+    }
+}
+
+#[cfg(feature = "orchard")]
+impl compact_formats::CompactOrchardAction {
+    /// Returns the note commitment for the output of this action.
+    ///
+    /// A convenience method that parses [`CompactOrchardAction.cmx`].
+    ///
+    /// [`CompactOrchardAction.cmx`]: #structfield.cmx
+    pub fn cmx(&self) -> Result<orchard::note::ExtractedNoteCommitment, ()> {
+        Option::from(orchard::note::ExtractedNoteCommitment::from_bytes(
+            &self.cmx[..].try_into().map_err(|_| ())?,
+        ))
+        .ok_or(())
+    }
+
+    /// Returns the nullifier for the spend of this action.
+    ///
+    /// A convenience method that parses [`CompactOrchardAction.nullifier`].
+    ///
+    /// [`CompactOrchardAction.nullifier`]: #structfield.nullifier
+    pub fn nf(&self) -> Result<orchard::note::Nullifier, ()> {
+        let nf_bytes: [u8; 32] = self.nullifier[..].try_into().map_err(|_| ())?;
+        Option::from(orchard::note::Nullifier::from_bytes(&nf_bytes)).ok_or(())
+    }
+
+    /// Returns the ephemeral public key for the output of this action.
+    ///
+    /// A convenience method that parses [`CompactOrchardAction.ephemeral_key`].
+    ///
+    /// [`CompactOrchardAction.ephemeral_key`]: #structfield.ephemeral_key
+    pub fn ephemeral_key(&self) -> Result<EphemeralKeyBytes, ()> {
+        self.ephemeral_key[..]
+            .try_into()
+            .map(EphemeralKeyBytes)
+            .map_err(|_| ())
     }
 }
 
@@ -198,14 +260,71 @@ impl<SpendAuth> From<&orchard::Action<SpendAuth>> for compact_formats::CompactOr
 
 impl service::TreeState {
     /// Deserializes and returns the Sapling note commitment tree field of the tree state.
-    pub fn sapling_tree(&self) -> io::Result<CommitmentTree<Node, NOTE_COMMITMENT_TREE_DEPTH>> {
-        let sapling_tree_bytes = hex::decode(&self.sapling_tree).map_err(|e| {
+    pub fn sapling_tree(
+        &self,
+    ) -> io::Result<CommitmentTree<Node, { sapling::NOTE_COMMITMENT_TREE_DEPTH }>> {
+        if self.tree.is_empty() {
+            Ok(CommitmentTree::empty())
+        } else {
+            let sapling_tree_bytes = hex::decode(&self.tree).map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Hex decoding of Sapling tree bytes failed: {:?}", e),
+                )
+            })?;
+            read_commitment_tree::<Node, _, { sapling::NOTE_COMMITMENT_TREE_DEPTH }>(
+                &sapling_tree_bytes[..],
+            )
+        }
+    }
+
+    /// Deserializes and returns the Sapling note commitment tree field of the tree state.
+    #[cfg(feature = "orchard")]
+    pub fn orchard_tree(
+        &self,
+    ) -> io::Result<CommitmentTree<MerkleHashOrchard, { orchard::NOTE_COMMITMENT_TREE_DEPTH as u8 }>>
+    {
+        if self.orchard_tree.is_empty() {
+            Ok(CommitmentTree::empty())
+        } else {
+            let orchard_tree_bytes = hex::decode(&self.orchard_tree).map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Hex decoding of Orchard tree bytes failed: {:?}", e),
+                )
+            })?;
+            read_commitment_tree::<
+                MerkleHashOrchard,
+                _,
+                { orchard::NOTE_COMMITMENT_TREE_DEPTH as u8 },
+            >(&orchard_tree_bytes[..])
+        }
+    }
+
+    /// Parses this tree state into a [`ChainState`] for use with [`scan_cached_blocks`].
+    ///
+    /// [`scan_cached_blocks`]: crate::data_api::chain::scan_cached_blocks
+    pub fn to_chain_state(&self) -> io::Result<ChainState> {
+        let mut hash_bytes = hex::decode(&self.hash).map_err(|e| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("Hex decoding of Sapling tree bytes failed: {:?}", e),
+                format!("Block hash is not valid hex: {:?}", e),
             )
         })?;
-        read_commitment_tree::<Node, _, NOTE_COMMITMENT_TREE_DEPTH>(&sapling_tree_bytes[..])
+        // Zcashd hex strings for block hashes are byte-reversed.
+        hash_bytes.reverse();
+
+        Ok(ChainState::new(
+            self.height
+                .try_into()
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Invalid block height"))?,
+            BlockHash::try_from_slice(&hash_bytes).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "Invalid block hash length.")
+            })?,
+            self.sapling_tree()?.to_frontier(),
+            #[cfg(feature = "orchard")]
+            self.orchard_tree()?.to_frontier(),
+        ))
     }
 }
 
@@ -243,6 +362,8 @@ pub enum ProposalDecodingError<DbError> {
     ProposalInvalid(ProposalError),
     /// An inputs field for the given protocol was present, but contained no input note references.
     EmptyShieldedInputs(ShieldedProtocol),
+    /// A memo field was provided for a transparent output.
+    TransparentMemo,
     /// Change outputs to the specified pool are not supported.
     InvalidChangeRecipient(PoolType),
 }
@@ -295,6 +416,9 @@ impl<E: Display> Display for ProposalDecodingError<E> {
                 "An inputs field was present for {:?}, but contained no note references.",
                 protocol
             ),
+            ProposalDecodingError::TransparentMemo => {
+                write!(f, "Transparent outputs cannot have memos.")
+            }
             ProposalDecodingError::InvalidChangeRecipient(pool_type) => write!(
                 f,
                 "Change outputs to the {} pool are not supported.",
@@ -621,20 +745,26 @@ impl proposal::Proposal {
                             .proposed_change
                             .iter()
                             .map(|cv| -> Result<ChangeValue, ProposalDecodingError<_>> {
+                                let value = NonNegativeAmount::from_u64(cv.value)
+                                    .map_err(|_| ProposalDecodingError::BalanceInvalid)?;
+                                let memo = cv
+                                    .memo
+                                    .as_ref()
+                                    .map(|bytes| {
+                                        MemoBytes::from_bytes(&bytes.value)
+                                            .map_err(ProposalDecodingError::MemoInvalid)
+                                    })
+                                    .transpose()?;
                                 match cv.pool_type()? {
                                     PoolType::Shielded(ShieldedProtocol::Sapling) => {
-                                        Ok(ChangeValue::sapling(
-                                            NonNegativeAmount::from_u64(cv.value).map_err(
-                                                |_| ProposalDecodingError::BalanceInvalid,
-                                            )?,
-                                            cv.memo
-                                                .as_ref()
-                                                .map(|bytes| {
-                                                    MemoBytes::from_bytes(&bytes.value)
-                                                        .map_err(ProposalDecodingError::MemoInvalid)
-                                                })
-                                                .transpose()?,
-                                        ))
+                                        Ok(ChangeValue::sapling(value, memo))
+                                    }
+                                    #[cfg(feature = "orchard")]
+                                    PoolType::Shielded(ShieldedProtocol::Orchard) => {
+                                        Ok(ChangeValue::orchard(value, memo))
+                                    }
+                                    PoolType::Transparent if memo.is_some() => {
+                                        Err(ProposalDecodingError::TransparentMemo)
                                     }
                                     t => Err(ProposalDecodingError::InvalidChangeRecipient(t)),
                                 }
@@ -669,5 +799,18 @@ impl proposal::Proposal {
             }
             other => Err(ProposalDecodingError::VersionInvalid(other)),
         }
+    }
+}
+
+#[cfg(feature = "lightwalletd-tonic-transport")]
+impl service::compact_tx_streamer_client::CompactTxStreamerClient<tonic::transport::Channel> {
+    /// Attempt to create a new client by connecting to a given endpoint.
+    pub async fn connect<D>(dst: D) -> Result<Self, tonic::transport::Error>
+    where
+        D: TryInto<tonic::transport::Endpoint>,
+        D::Error: Into<tonic::codegen::StdError>,
+    {
+        let conn = tonic::transport::Endpoint::new(dst)?.connect().await?;
+        Ok(Self::new(conn))
     }
 }
